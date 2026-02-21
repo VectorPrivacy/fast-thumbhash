@@ -1,0 +1,12 @@
+[package]
+name = "fast-thumbhash"
+version = "0.1.0"
+edition = "2021"
+description = "A fast ThumbHash encoder/decoder — 10x+ faster drop-in replacement"
+license = "MIT"
+repository = "https://github.com/VectorPrivacy/fast-thumbhash"
+keywords = ["thumbhash", "image", "placeholder", "blur", "preview"]
+categories = ["multimedia::images", "encoding"]
+
+[dev-dependencies]
+thumbhash = "0.1"
