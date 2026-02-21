@@ -537,6 +537,115 @@ pub fn thumb_hash_to_approximate_aspect_ratio(hash: &[u8]) -> Result<f32, ()> {
     Ok(lx as f32 / ly as f32)
 }
 
+// ─── Base91 encoding ───────────────────────────────────────────────────────
+//
+// Base91 uses 91 printable ASCII characters to encode binary data with only
+// ~23% overhead (vs base64's 33%). The alphabet excludes `"` and `\` so the
+// output is safe for JSON strings without escaping.
+//
+// Encoding: process 13 bits at a time → 2 output chars.
+// Decoding: reverse the process.
+
+/// The 91-character alphabet: printable ASCII excluding `"`, `\`, and `-`.
+const B91_ALPHABET: &[u8; 91] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~ ";
+
+/// Lookup table: ASCII byte → alphabet index (255 = invalid).
+const fn build_decode_table() -> [u8; 256] {
+    let mut table = [255u8; 256];
+    let mut i = 0;
+    while i < 91 {
+        table[B91_ALPHABET[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+}
+
+const B91_DECODE: [u8; 256] = build_decode_table();
+
+/// Encode bytes to a base91 string.
+pub fn base91_encode(data: &[u8]) -> String {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    let mut n: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for &byte in data {
+        n |= (byte as u32) << bits;
+        bits += 8;
+        if bits > 13 {
+            let mut v = n & 8191; // 13 bits
+            if v > 88 {
+                n >>= 13;
+                bits -= 13;
+            } else {
+                v = n & 16383; // 14 bits
+                n >>= 14;
+                bits -= 14;
+            }
+            out.push(B91_ALPHABET[(v % 91) as usize]);
+            out.push(B91_ALPHABET[(v / 91) as usize]);
+        }
+    }
+
+    if bits > 0 {
+        out.push(B91_ALPHABET[(n % 91) as usize]);
+        if bits > 7 || n > 90 {
+            out.push(B91_ALPHABET[(n / 91) as usize]);
+        }
+    }
+
+    // SAFETY: B91_ALPHABET contains only ASCII bytes
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Decode a base91 string back to bytes. Returns `Err(())` on invalid input.
+pub fn base91_decode(encoded: &str) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::with_capacity(encoded.len());
+    let mut n: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut queue: i32 = -1;
+
+    for &byte in encoded.as_bytes() {
+        let d = B91_DECODE[byte as usize];
+        if d == 255 {
+            return Err(());
+        }
+        if queue < 0 {
+            queue = d as i32;
+        } else {
+            let v = queue as u32 + (d as u32) * 91;
+            queue = -1;
+            n |= v << bits;
+            bits += if v & 8191 > 88 { 13 } else { 14 };
+            while bits >= 8 {
+                out.push(n as u8);
+                n >>= 8;
+                bits -= 8;
+            }
+        }
+    }
+
+    if queue >= 0 {
+        out.push((n | ((queue as u32) << bits)) as u8);
+    }
+
+    Ok(out)
+}
+
+/// Encode an RGBA image directly to a base91-encoded ThumbHash string.
+///
+/// Equivalent to `base91_encode(&rgba_to_thumb_hash(w, h, rgba))`.
+pub fn rgba_to_thumb_hash_b91(w: usize, h: usize, rgba: &[u8]) -> String {
+    base91_encode(&rgba_to_thumb_hash(w, h, rgba))
+}
+
+/// Decode a base91-encoded ThumbHash string to an RGBA image.
+///
+/// Equivalent to `thumb_hash_to_rgba(&base91_decode(s)?)`.
+pub fn thumb_hash_from_b91(encoded: &str) -> Result<(usize, usize, Vec<u8>), ()> {
+    let hash = base91_decode(encoded)?;
+    thumb_hash_to_rgba(&hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,5 +837,73 @@ mod tests {
                 "aspect ratio mismatch for {w}x{h}: {ours} vs {theirs}"
             );
         }
+    }
+
+    // ── Base91 tests ──────────────────────────────────────────────
+
+    #[test]
+    fn base91_roundtrip_empty() {
+        assert_eq!(base91_decode(&base91_encode(b"")).unwrap(), b"");
+    }
+
+    #[test]
+    fn base91_roundtrip_single_byte() {
+        for b in 0..=255u8 {
+            let encoded = base91_encode(&[b]);
+            let decoded = base91_decode(&encoded).unwrap();
+            assert_eq!(decoded, &[b], "roundtrip failed for byte {b}");
+        }
+    }
+
+    #[test]
+    fn base91_roundtrip_various_lengths() {
+        let mut data = Vec::new();
+        for len in 0..=50 {
+            data.push((len * 7 + 13) as u8);
+            let encoded = base91_encode(&data);
+            let decoded = base91_decode(&encoded).unwrap();
+            assert_eq!(decoded, data, "roundtrip failed for len {len}");
+        }
+    }
+
+    #[test]
+    fn base91_is_json_safe() {
+        // Encode random-ish data and verify no " or \ in output
+        let data: Vec<u8> = (0..100).map(|i| (i * 37 + 59) as u8).collect();
+        let encoded = base91_encode(&data);
+        assert!(!encoded.contains('"'), "base91 output must not contain double quote");
+        assert!(!encoded.contains('\\'), "base91 output must not contain backslash");
+        assert!(encoded.is_ascii(), "base91 output must be ASCII");
+    }
+
+    #[test]
+    fn base91_is_smaller_than_base64() {
+        let pixels = solid_rgba(32, 32, 200, 100, 50);
+        let hash = rgba_to_thumb_hash(32, 32, &pixels);
+
+        let b64_len = ((hash.len() * 4 / 3) + 3) & !3; // base64 with padding
+        let b91_len = base91_encode(&hash).len();
+
+        assert!(
+            b91_len < b64_len,
+            "base91 ({b91_len}) should be shorter than base64 ({b64_len})"
+        );
+    }
+
+    #[test]
+    fn base91_decode_rejects_invalid() {
+        // `"` is not in our alphabet
+        assert!(base91_decode("hello\"world").is_err());
+        // `\` is not in our alphabet
+        assert!(base91_decode("hello\\world").is_err());
+    }
+
+    #[test]
+    fn base91_thumbhash_convenience_roundtrip() {
+        let pixels = solid_rgba(48, 32, 100, 200, 50);
+        let encoded = rgba_to_thumb_hash_b91(48, 32, &pixels);
+        let (w, h, rgba) = thumb_hash_from_b91(&encoded).unwrap();
+        assert!(w > 0 && h > 0);
+        assert_eq!(rgba.len(), w * h * 4);
     }
 }
